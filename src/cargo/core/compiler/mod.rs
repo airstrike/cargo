@@ -1789,6 +1789,28 @@ fn build_deps_args(
         cmd.arg(arg);
     }
 
+    // If this unit is a `no_std` crate that the `cascade-dylib`
+    // feature promoted to `dylib`, force-link `std` so that the dylib's
+    // link step can resolve `#[panic_handler]`, `#[global_allocator]`,
+    // and `eh_personality`. Routing the metadata edge through `std`
+    // (a real toolchain crate available in both rlib and dylib formats)
+    // sidesteps rustc's link-format-uniformity invariant for downstream
+    // consumers that reach the promoted dylib via mixed rlib/dylib
+    // paths. See [`cascade_dylib_shim`] for the rationale.
+    if cascade_dylib_shim::unit_needs_std_link(
+        unit.profile.crate_type.as_deref(),
+        &unit.target,
+        &unit.pkg,
+    )? {
+        let std_args = cascade_dylib_shim::std_link_args(bcx, unit.kind)?;
+        if !std_args.is_empty() {
+            for arg in std_args {
+                cmd.arg(arg);
+            }
+            unstable_opts = true;
+        }
+    }
+
     // Inject `@loader_path/deps` (macOS) / `$ORIGIN/deps` (Linux) as an
     // additional rpath for cascade-dylib dylibs so the dynamic loader
     // finds the SVH-stamped sibling dylibs at `target/<profile>/deps/`

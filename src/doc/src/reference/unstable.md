@@ -994,6 +994,14 @@ The cascade BFS follows only **runtime-dep** (`DepKind::Normal`) edges:
 If multiple versions of the same name are in the resolve graph, every reached
 version is promoted independently.
 
+### `no_std` auto-injection
+
+Cargo additionally force-links `std` into any cascade-promoted package whose
+top-level source declares `#![no_std]`. Without this, the dylib link step
+would fail to resolve `#[panic_handler]`, `#[global_allocator]`, and the
+unwinder's `eh_personality` lang item. This is automatic — no user
+configuration required.
+
 ### rpath embedding
 
 On macOS and ELF Unix targets, every cascade dylib (root or promoted) is

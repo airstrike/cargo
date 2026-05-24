@@ -678,6 +678,208 @@ fn cascade_dylib_cli_unknown_spec_warns() {
 }
 
 #[cargo_test]
+fn cascade_dylib_no_std_std_link() {
+    // A `no_std` crate cascade-promoted to `dylib` would normally fail to
+    // link (no `#[panic_handler]`, no `#[global_allocator]`, no unwinder).
+    // Cargo force-links `std` itself by passing
+    //   `--extern force:std=<libstd-*.dylib>`
+    //   `--extern force:std=<libstd-*.rmeta>`
+    // so the dylib link step succeeds. Routing the metadata edge through
+    // the real `std` toolchain crate (which is available in both rlib and
+    // dylib formats) sidesteps rustc's link-format uniformity invariant
+    // for downstream consumers that reach the promoted dylib via mixed
+    // rlib/dylib paths.
+    //
+    // We assert on the rustc invocation rather than on build success
+    // because `--extern force:` requires `-Z unstable-options`, which
+    // only nightly rustc accepts. The cargo behavior under test is
+    // independent of which rustc actually runs.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file(
+            "bar/src/lib.rs",
+            "#![no_std]\npub fn answer() -> u32 { 42 }\n",
+        )
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_contains("[..]--crate-type lib --crate-type dylib [..]")
+        .with_stderr_contains("[..]--extern [..]force:std=[..]libstd-[..]")
+        .with_stderr_contains("[..]-Z unstable-options[..]")
+        .without_status()
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_no_std_std_link_block_doc_comment() {
+    // Some crates (e.g. pin-project-lite) lead their `lib.rs` with a
+    // `/*! ... */` outer block doc-comment before `#![no_std]`. The
+    // textual scan must skip block comments — including multi-line —
+    // when looking for the attribute, otherwise std-injection misses
+    // the crate and the dylib link fails on `#[panic_handler]`.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file(
+            "bar/src/lib.rs",
+            "// SPDX-License-Identifier: Apache-2.0\n\
+             \n\
+             /*!\n\
+             A lightweight crate.\n\
+             \n\
+             Multi-line doc that spans several lines before the\n\
+             attribute.\n\
+             */\n\
+             \n\
+             #![no_std]\n\
+             pub fn answer() -> u32 { 42 }\n",
+        )
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_contains("[..]--extern [..]force:std=[..]libstd-[..]")
+        .without_status()
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_no_std_std_link_cfg_attr() {
+    // Real-world `no_std` crates often use the conditional form
+    // (e.g. `#![cfg_attr(not(test), no_std)]`). The detection
+    // heuristic recognizes both shapes.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file(
+            "bar/src/lib.rs",
+            "#![cfg_attr(not(test), no_std)]\npub fn answer() -> u32 { 42 }\n",
+        )
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_contains("[..]--extern [..]force:std=[..]libstd-[..]")
+        .without_status()
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_std_link_skipped_for_std_crate() {
+    // A regular (non-`no_std`) crate promoted to `dylib` does not need
+    // the explicit `std` force-link — `extern crate std` is implicit and
+    // pulls in all the runtime symbols itself. The `--extern force:std`
+    // flag must be absent from rustc's invocation in that case.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_data(str![[r#"
+[LOCKING] 1 package to latest compatible version
+     Cascade promoted 1 package(s) to dylib in profile `dev`
+[COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .with_stderr_does_not_contain("force:std=")
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_std_link_passes_dylib_and_rmeta() {
+    // The shipped standard library uses `-Zembed-metadata=no`: the
+    // `.dylib` carries only a metadata stub and rustc demands the
+    // `.rmeta` separately. Cargo passes both `--extern` entries so the
+    // dylib gets dynamic linkage AND full metadata.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file(
+            "bar/src/lib.rs",
+            "#![no_std]\npub fn answer() -> u32 { 42 }\n",
+        )
+        .build();
+
+    // Two `--extern force:std=` entries on bar's invocation: one for the
+    // dylib (gives linkage), one for the rmeta (gives metadata).
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_contains("[..]--crate-name bar [..]--extern [..]force:std=[..]libstd-[..]")
+        .with_stderr_contains("[..]--extern [..]force:std=[..]libstd-[..].rmeta[..]")
+        .without_status()
+        .run();
+}
+
+#[cargo_test]
 fn cascade_dylib_implicit_from_manifest() {
     // A crate whose own `[lib].crate-type` contains `dylib` is automatically
     // a cascade root once `-Z cascade-dylib` is on (bare flag, no spec
