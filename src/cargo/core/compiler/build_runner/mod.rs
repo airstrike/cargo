@@ -12,6 +12,9 @@ use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use anyhow::{Context as _, bail};
 use cargo_util::paths;
+// FORK: `Level`/`Message` were only used by the disabled
+// `check_collisions` warning emitter — see comment in that fn.
+#[allow(unused_imports)]
 use cargo_util_terminal::report::{Level, Message};
 use filetime::FileTime;
 use itertools::Itertools;
@@ -583,6 +586,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// See <https://github.com/rust-lang/cargo/issues/6313> for more.
     #[tracing::instrument(skip_all)]
     fn check_collisions(&self) -> CargoResult<()> {
+        // FORK: silence "output filename collision" warnings — under
+        // cascade-dylib the same crate routinely appears as both an rlib and
+        // a promoted dylib, which collides on the same `lib<name>.dylib`
+        // output path. The collision is by design, not actionable user
+        // error, so the warning is just noise. Doc-collision *errors* below
+        // (a different, real-correctness check) are preserved. The helper
+        // bindings here are wrapped instead of deleted so an upstream rebase
+        // of `check_collisions` produces a recognizable conflict region.
+        /*
         let mut output_collisions = HashMap::new();
         let describe_collision = |unit: &Unit, other_unit: &Unit| -> String {
             format!(
@@ -636,6 +648,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 )
             }
         };
+        */
 
         fn doc_collision_error(unit: &Unit, other_unit: &Unit) -> CargoResult<()> {
             bail!(
@@ -685,6 +698,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     doc_collision_error(unit, prev)?;
                 }
             }
+            // FORK: warning emission disabled — see comment at top of fn.
+            /*
             for output in self.outputs(unit)?.iter() {
                 if let Some(other_unit) = output_collisions.insert(output.path.clone(), unit) {
                     if unit.mode.is_doc() {
@@ -718,6 +733,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     }
                 }
             }
+            */
         }
         Ok(())
     }

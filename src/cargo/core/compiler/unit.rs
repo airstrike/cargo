@@ -282,6 +282,17 @@ impl UnitInterner {
                 new_target.set_kind(TargetKind::Lib(vec![CrateType::Rlib]));
                 new_target
             }
+            // Per-package profile override of `crate-type`. Only applies to
+            // ordinary library targets — proc-macros, build scripts, bins,
+            // tests, examples, and benches keep their manifest-declared kind.
+            (false, TargetKind::Lib(_))
+                if profile.crate_type.is_some() && !target.proc_macro() =>
+            {
+                let crate_types = profile.crate_type.clone().expect("matched on Some above");
+                let mut new_target = Target::clone(target);
+                new_target.set_kind(TargetKind::Lib(crate_types));
+                new_target
+            }
             _ => target.clone(),
         };
         let inner = self.intern_inner(&UnitInner {

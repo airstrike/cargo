@@ -933,6 +933,16 @@ pub struct TomlProfile {
     pub strip: Option<StringOrBool>,
     // Note that `rustflags` is used for the cargo-feature `profile_rustflags`
     pub rustflags: Option<Vec<String>>,
+    /// Internal carrier for synthesized per-package `[lib].crate-type`
+    /// overrides written by the `cascade-dylib` machinery. Not a
+    /// user-input field — `#[serde(skip)]` blocks it from being set via
+    /// `Cargo.toml` and from being emitted on serialization. The cascade
+    /// reads `-Z cascade-dylib[=roots,...]` and writes synthesized
+    /// `Some(vec!["lib", "dylib"])` entries here for every package in
+    /// the runtime-dep closure of a cascade root.
+    #[serde(skip)]
+    #[cfg_attr(feature = "unstable-schema", schemars(skip))]
+    pub crate_type: Option<Vec<String>>,
     // These two fields must be last because they are sub-tables, and TOML
     // requires all non-tables to be listed first.
     pub package: Option<BTreeMap<ProfilePackageSpec, TomlProfile>>,
@@ -992,6 +1002,10 @@ impl TomlProfile {
 
         if let Some(v) = &profile.rustflags {
             self.rustflags = Some(v.clone());
+        }
+
+        if let Some(v) = &profile.crate_type {
+            self.crate_type = Some(v.clone());
         }
 
         if let Some(other_package) = &profile.package {

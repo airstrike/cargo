@@ -609,3 +609,503 @@ fn build_override_shared() {
 
     p.cargo("run").run();
 }
+
+#[cargo_test]
+fn cascade_dylib_cli_root_promotes_named_package() {
+    // `-Z cascade-dylib=bar` makes `bar` a cascade root. With no further
+    // runtime deps, that just promotes `bar` itself to `lib + dylib`.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_data(str![[r#"
+[LOCKING] 1 package to latest compatible version
+     Cascade promoted 1 package(s) to dylib in profile `dev`
+[COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_cli_unknown_spec_warns() {
+    // A `-Z cascade-dylib=<spec>` entry that doesn't match any package in
+    // the resolve graph emits a warning but does not fail the build.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("check -Z cascade-dylib=does-not-exist")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_contains(
+            "[WARNING] -Z cascade-dylib spec `does-not-exist` did not match any package in the resolve graph",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_implicit_from_manifest() {
+    // A crate whose own `[lib].crate-type` contains `dylib` is automatically
+    // a cascade root once `-Z cascade-dylib` is on (bare flag, no spec
+    // list): every non-proc-macro package reachable from it via runtime-dep
+    // edges is promoted to `["lib", "dylib"]` for the active profile. This
+    // is the canonical hot-reload-style flow — no manifest mutation
+    // required beyond the existing `crate-type` declaration the workspace
+    // lib already had.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [lib]
+                crate-type = ["lib", "dylib"]
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "extern crate baz;")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib")
+        .masquerade_as_nightly_cargo(&[])
+        // foo (manifest dylib) is the root; bar and baz are reached via
+        // runtime-dep BFS and synthesized into per-package overrides.
+        .with_stderr_data(str![[r#"
+[LOCKING] 2 packages to latest compatible versions
+     Cascade promoted 2 package(s) to dylib in profile `dev`
+[COMPILING] baz v0.5.0 ([ROOT]/foo/baz)
+[RUNNING] `rustc --crate-name baz [..]--crate-type lib --crate-type dylib [..]`
+[COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]--crate-type lib --crate-type dylib [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+#[cfg(unix)]
+fn cascade_dylib_emits_loader_path_deps_rpath() {
+    // Every dylib (root or cascade-promoted) under `-Z cascade-dylib` gets
+    // an extra `-Wl,-rpath,@loader_path/deps` (`$ORIGIN/deps` on Linux)
+    // so the dynamic loader finds the SVH-stamped sibling dylibs at
+    // `target/<profile>/deps/` regardless of who's loading the dylib.
+    // Without this, consumers that don't have `DYLD_FALLBACK_LIBRARY_PATH`
+    // set (`cargo install`'d binaries, `dlopen` from arbitrary tooling)
+    // hit `dlopen failed` on the first `@rpath/lib*-<svh>.dylib`
+    // reference.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [lib]
+                crate-type = ["lib", "dylib"]
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    // `[..]/deps` matches both `@loader_path/deps` (macOS) and
+    // `$ORIGIN/deps` (Linux + BSDs). The root foo dylib AND the
+    // cascade-promoted bar dylib both carry the rpath.
+    p.cargo("build -v -Z cascade-dylib")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_data(str![[r#"
+[LOCKING] 1 package to latest compatible version
+     Cascade promoted 1 package(s) to dylib in profile `dev`
+[COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
+[RUNNING] `rustc --crate-name bar [..]link-arg=-Wl,-rpath,[..]/deps[..]`
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]link-arg=-Wl,-rpath,[..]/deps[..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_cli_spec_walks_runtime_closure() {
+    // A `-Z cascade-dylib=bar` entry makes `bar` a cascade root, walking
+    // through `bar`'s runtime deps. `baz`, reached only through `bar`'s
+    // `[dependencies]`, is promoted by the cascade BFS.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "extern crate baz;")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        // bar is the named root; baz is promoted by the cascade through
+        // bar's runtime dep.
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name baz [..]--crate-type lib --crate-type dylib [..]`
+...
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+...
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_no_op_without_flag() {
+    // The cascade only fires when `-Z cascade-dylib` is passed. A package
+    // using `crate-type = ["lib", "dylib"]` in its manifest without the
+    // flag gets cargo's standard dylib emission for itself but no cascade
+    // through deps — i.e. the same behavior as stable cargo.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [lib]
+                crate-type = ["lib", "dylib"]
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v")
+        // bar must NOT be cascade-promoted: built as plain rlib only.
+        .with_stderr_line_without(
+            &["[RUNNING] `rustc --crate-name bar"],
+            &["--crate-type dylib"],
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_skips_proc_macro() {
+    // Proc-macro crates can't be dylibs. When a CLI-named root is a
+    // proc-macro, cascade root collection skips it; the intern site
+    // also filters it out defensively, so the proc-macro keeps its
+    // native kind.
+    Package::new("shared", "1.0.0").publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                edition = "2018"
+
+                [dependencies]
+                pm = { path = "pm" }
+            "#,
+        )
+        .file("src/lib.rs", r#"pm::eat!{}"#)
+        .file(
+            "pm/Cargo.toml",
+            r#"
+                [package]
+                name = "pm"
+                version = "0.1.0"
+                edition = "2015"
+
+                [lib]
+                proc-macro = true
+
+                [dependencies]
+                shared = "1.0"
+            "#,
+        )
+        .file(
+            "pm/src/lib.rs",
+            r#"
+                extern crate proc_macro;
+                use proc_macro::TokenStream;
+                #[proc_macro]
+                pub fn eat(_item: TokenStream) -> TokenStream {
+                    "".parse().unwrap()
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=pm")
+        .masquerade_as_nightly_cargo(&[])
+        // pm is built with --crate-type proc-macro, NOT promoted.
+        .with_stderr_line_without(
+            &["[RUNNING] `rustc --crate-name pm"],
+            &["--crate-type lib --crate-type dylib"],
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_skips_build_dep() {
+    // Build-script dep edges must not be followed: build scripts run on the
+    // host and their deps don't reach the runtime dylib graph.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+                build = "build.rs"
+
+                [build-dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "")
+        .file("bar/build.rs", "fn main() {}")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        // bar is the CLI-named cascade root and IS promoted.
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+...
+"#]])
+        // baz is reached only via a build-dep edge and must NOT be promoted.
+        .with_stderr_line_without(
+            &["[RUNNING] `rustc --crate-name baz"],
+            &["--crate-type dylib"],
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_skips_release_profile_for_manifest_root() {
+    // Source 1 (manifest `[lib].crate-type` includes `dylib`) is profile-
+    // agnostic in a Cargo manifest, but cascade is a dev-loop concept.
+    // Building under `release` (or any profile not transitively inheriting
+    // `dev`) must NOT treat the manifest dylib as a cascade root, so deps
+    // stay rlib-only. This avoids release-only link failures on crates
+    // whose Rust wrapper statically links a C archive (tree-sitter et al.).
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [lib]
+                crate-type = ["lib", "dylib"]
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v --release -Z cascade-dylib")
+        .masquerade_as_nightly_cargo(&[])
+        // bar must NOT be cascade-promoted in release: rlib only.
+        .with_stderr_line_without(
+            &["[RUNNING] `rustc --crate-name bar"],
+            &["--crate-type dylib"],
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_release_cli_root_still_fires() {
+    // Power-user opt-in: source 1 (manifest dylib) doesn't contribute a
+    // cascade root in `release`, but a CLI-named root does. The cascade
+    // BFS walks from the named root through its runtime deps as usual.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "extern crate baz;")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -v --release -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name baz [..]--crate-type lib --crate-type dylib [..]`
+...
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+...
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_fires_in_test_profile() {
+    // The `test` profile inherits `dev` (ProfileRoot::Debug), so source 1
+    // still contributes a cascade root under `cargo test`. This keeps the
+    // cross-dylib hot-reload integration test workflow working.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [lib]
+                crate-type = ["lib", "dylib"]
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("test -v --no-run -Z cascade-dylib")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+...
+"#]])
+        .run();
+}

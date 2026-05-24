@@ -22,8 +22,9 @@
 //! The algorithm happens within [`ProfileMaker::get_profile`].
 
 use crate::core::Feature;
-use crate::core::compiler::{CompileKind, CompileTarget, Unit};
-use crate::core::dependency::Artifact;
+use crate::core::PackageSet;
+use crate::core::compiler::{CompileKind, CompileTarget, CrateType, Unit};
+use crate::core::dependency::{Artifact, DepKind};
 use crate::core::resolver::features::FeaturesFor;
 use crate::core::{PackageId, PackageIdSpec, PackageIdSpecQuery, Resolve, Target, Workspace};
 use crate::util::interning::InternedString;
@@ -385,6 +386,181 @@ impl Profiles {
         Ok(())
     }
 
+    /// Expand the `cascade-dylib` rule into synthesized per-package overrides
+    /// for every non-proc-macro package reachable via runtime-dep edges from
+    /// any cascade root. Two sources contribute roots:
+    ///
+    /// 1. The package's own `[lib].crate-type` (manifest) contains `dylib`.
+    ///    Only fires when the requested profile is dev-rooted (cascade
+    ///    promotion strips native-static-libs contributions from rlibs that
+    ///    wrap a `.a`, producing release-only link errors).
+    /// 2. Each spec in the `-Z cascade-dylib=spec1,spec2,...` CLI list,
+    ///    parsed as a [`PackageIdSpec`] and matched against the resolve
+    ///    graph. Fires in any profile.
+    ///
+    /// The cascade fires only when `-Z cascade-dylib[=...]` is passed. A
+    /// bare `-Z cascade-dylib` (no `=`) enables source 1 only; passing
+    /// `=spec,...` enables source 1 and adds the named packages as
+    /// additional roots.
+    ///
+    /// Synthesized entries are written into the requested profile's
+    /// `[profile.<P>.package.<id>]` map. If the user wrote an unrelated
+    /// per-package override for the same package (e.g. `opt-level = 3`),
+    /// the cascade adds `crate-type` to that existing entry rather than
+    /// skipping it — both settings apply.
+    ///
+    /// Must be called after [`Profiles::validate_packages`] and before unit
+    /// graph construction.
+    pub fn apply_cascade_dylib(
+        &mut self,
+        resolve: &Resolve,
+        pkg_set: &PackageSet<'_>,
+        gctx: &GlobalContext,
+    ) -> CargoResult<()> {
+        // Cascade fires only when `-Z cascade-dylib[=spec,...]` is passed.
+        // None → flag absent; Some(empty) → bare flag (source 1 only);
+        // Some(specs) → source 1 plus the named additional roots.
+        let Some(cli_roots) = gctx.cli_unstable().cascade_dylib.as_ref() else {
+            return Ok(());
+        };
+
+        // Index by-id metadata we'll query repeatedly.
+        let proc_macro: HashMap<PackageId, bool> = pkg_set
+            .packages()
+            .map(|p| (p.package_id(), p.proc_macro()))
+            .collect();
+        let manifest_dylib: HashSet<PackageId> = pkg_set
+            .packages()
+            .filter(|p| {
+                p.library()
+                    .map(|t| t.rustc_crate_types().contains(&CrateType::Dylib))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.package_id())
+            .collect();
+
+        // Only apply cascade to the profile being requested for this build.
+        // The other profiles in `by_name` (test/doc/bench/release) may
+        // inherit dylib status, but applying their cascades would emit
+        // duplicate verbose output for the same user setup.
+        let requested = self.requested_profile;
+        let Some((profile_name, maker)) = self
+            .by_name
+            .iter_mut()
+            .find(|(name, _)| **name == requested)
+        else {
+            return Ok(());
+        };
+        // Whether the requested profile transitively inherits `dev`. The
+        // ProfileMaker's `default` field carries the seed Profile cloned
+        // from its inherits chain root (dev → ProfileRoot::Debug, release
+        // → ProfileRoot::Release), so this check covers `dev`, `test`,
+        // `doc`, and any user-defined profile that ultimately inherits
+        // from `dev`.
+        let is_dev_rooted = maker.default.root == ProfileRoot::Debug;
+        // Materialize the merged TOML even if the user wrote no
+        // `[profile.<P>]` block — cascade can still synthesize per-package
+        // overrides into it.
+        let toml = maker.toml.get_or_insert_with(TomlProfile::default);
+
+        // Collect roots.
+        let mut roots: HashSet<PackageId> = HashSet::new();
+
+        // Source 1: manifest `[lib].crate-type` contains `dylib`. Only
+        // contributes roots in dev-rooted profiles; in a release-rooted
+        // profile the manifest dylib still emits (cargo's stock behavior),
+        // but no BFS over its runtime deps fires. Source 2 still fires in
+        // any profile, so a release-profile cascade can be opted into by
+        // passing the desired roots explicitly on the CLI.
+        if is_dev_rooted {
+            roots.extend(manifest_dylib.iter().copied());
+        }
+
+        // Source 2: CLI-named roots from `-Z cascade-dylib=spec1,spec2,...`.
+        for spec_str in cli_roots {
+            let spec = PackageIdSpec::parse(spec_str).with_context(|| {
+                format!("invalid package spec `{spec_str}` in -Z cascade-dylib")
+            })?;
+            let mut matched = false;
+            for id in resolve.iter() {
+                if spec.matches(id) {
+                    roots.insert(id);
+                    matched = true;
+                }
+            }
+            if !matched {
+                gctx.shell().warn(format!(
+                    "-Z cascade-dylib spec `{spec_str}` did not match any \
+                     package in the resolve graph",
+                ))?;
+            }
+        }
+
+        // Proc-macros can't be dylibs.
+        roots.retain(|id| !proc_macro.get(id).copied().unwrap_or(false));
+
+        if roots.is_empty() {
+            return Ok(());
+        }
+
+        // BFS over runtime-dep edges from each root.
+        let mut closure: HashSet<PackageId> = roots.clone();
+        let mut queue: Vec<PackageId> = roots.into_iter().collect();
+        while let Some(pkg) = queue.pop() {
+            for (dep_id, deps) in resolve.deps(pkg) {
+                // Follow only runtime-dep edges. Build-script deps run on
+                // the host and don't reach the runtime dylib graph;
+                // dev-deps don't apply to non-test builds.
+                if !deps.iter().any(|d| d.kind() == DepKind::Normal) {
+                    continue;
+                }
+                if proc_macro.get(&dep_id).copied().unwrap_or(false) {
+                    continue;
+                }
+                if closure.insert(dep_id) {
+                    queue.push(dep_id);
+                }
+            }
+        }
+
+        // Synthesize per-package overrides for the closure. Mutates
+        // existing entries (so user-set opt-level/codegen-units/etc.
+        // continue to apply alongside the cascade-set crate-type) and
+        // skips packages whose manifest already emits a dylib.
+        let package_map = toml.package.get_or_insert_with(BTreeMap::new);
+        let mut promoted_count = 0usize;
+        for id in &closure {
+            if manifest_dylib.contains(id) {
+                continue;
+            }
+            let mut spec = PackageIdSpec::new(id.name().to_string());
+            if let Ok(pv) = id.version().to_string().parse() {
+                spec = spec.with_version(pv);
+            }
+            let key = ProfilePackageSpec::Spec(spec);
+            let entry = package_map
+                .entry(key)
+                .or_insert_with(TomlProfile::default);
+            if entry.crate_type.is_none() {
+                entry.crate_type = Some(vec!["lib".into(), "dylib".into()]);
+                promoted_count += 1;
+            }
+        }
+
+        if promoted_count > 0 {
+            let profile_name = *profile_name;
+            gctx.shell().verbose(|s| {
+                s.status(
+                    "Cascade",
+                    format!(
+                        "promoted {promoted_count} package(s) to dylib in profile `{profile_name}`",
+                    ),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// Returns the profile maker for the given profile name.
     fn get_profile_maker(&self, name: &str) -> CargoResult<&ProfileMaker> {
         self.by_name
@@ -581,6 +757,9 @@ fn merge_profile(profile: &mut Profile, toml: &TomlProfile) {
     if let Some(hint_mostly_unused) = toml.hint_mostly_unused {
         profile.hint_mostly_unused = Some(hint_mostly_unused);
     }
+    if let Some(ref crate_type) = toml.crate_type {
+        profile.crate_type = Some(crate_type.iter().map(CrateType::from).collect());
+    }
     profile.strip = match toml.strip {
         Some(StringOrBool::Bool(true)) => Strip::Resolved(StripInner::Named("symbols".into())),
         Some(StringOrBool::Bool(false)) => Strip::Resolved(StripInner::None),
@@ -632,6 +811,11 @@ pub struct Profile {
     pub trim_paths: Option<TomlTrimPaths>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint_mostly_unused: Option<bool>,
+    /// Override for the package's `[lib].crate-type`, synthesized by the
+    /// `cascade-dylib` machinery. `None` means "no override; use the
+    /// manifest's value".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crate_type: Option<Vec<CrateType>>,
 }
 
 impl Default for Profile {
@@ -654,6 +838,7 @@ impl Default for Profile {
             rustflags: vec![],
             trim_paths: None,
             hint_mostly_unused: None,
+            crate_type: None,
         }
     }
 }
@@ -684,6 +869,7 @@ compact_debug! {
                 rustflags
                 trim_paths
                 hint_mostly_unused
+                crate_type
             )]
         }
     }
@@ -750,7 +936,12 @@ impl Profile {
             self.debug_assertions,
             self.overflow_checks,
             self.rpath,
-            (self.incremental, self.panic, self.strip),
+            (
+                self.incremental,
+                self.panic,
+                self.strip,
+                &self.crate_type,
+            ),
             &self.rustflags,
             &self.trim_paths,
         )

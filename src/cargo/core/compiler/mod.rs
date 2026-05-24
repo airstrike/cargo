@@ -45,6 +45,7 @@ mod locking;
 mod lto;
 mod output_depinfo;
 mod output_sbom;
+pub mod cascade_dylib_shim;
 pub mod rustdoc;
 pub mod standard_lib;
 pub mod timings;
@@ -1785,6 +1786,16 @@ fn build_deps_args(
         }
     }
     for arg in extern_args(build_runner, unit, &mut unstable_opts)? {
+        cmd.arg(arg);
+    }
+
+    // Inject `@loader_path/deps` (macOS) / `$ORIGIN/deps` (Linux) as an
+    // additional rpath for cascade-dylib dylibs so the dynamic loader
+    // finds the SVH-stamped sibling dylibs at `target/<profile>/deps/`
+    // regardless of who's loading the dylib — `cargo run`'s
+    // `DYLD_FALLBACK_LIBRARY_PATH` doesn't extend to `cargo install`'d
+    // binaries or arbitrary `dlopen` consumers.
+    for arg in cascade_dylib_shim::cascade_rpath_args(bcx, unit)? {
         cmd.arg(arg);
     }
 

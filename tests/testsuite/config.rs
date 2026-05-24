@@ -1674,6 +1674,7 @@ fn all_profile_options() {
         package: None,
         build_override: None,
         rustflags: None,
+        crate_type: None,
         trim_paths: None,
         hint_mostly_unused: None,
     };

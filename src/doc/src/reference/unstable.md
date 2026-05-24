@@ -101,6 +101,7 @@ Each new feature described below should explain how to use it.
     * [compile-time-deps](#compile-time-deps) --- Perma-unstable feature for rust-analyzer
     * [fine-grain-locking](#fine-grain-locking) --- Use fine grain locking instead of locking the entire build cache
     * [json-target-spec](#json-target-spec) --- Allows the use of `.json` custom target specs.
+    * [`cascade-dylib`](#cascade-dylib) --- Cascade-promote dylib status through the runtime-dep closure.
 * rustdoc
     * [rustdoc-map](#rustdoc-map) --- Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
     * [scrape-examples](#scrape-examples) --- Shows examples within documentation.
@@ -892,6 +893,157 @@ profile-rustflags = true
 
 [profile.release]
 rustflags = [ "-C", "..." ]
+```
+
+## `cascade-dylib`
+* Tracking Issue: not yet filed
+
+This is a CLI-only unstable feature. Passing `-Z cascade-dylib[=spec,...]`
+asks cargo to **cascade** dylib promotion through the runtime-dep closure:
+every package whose effective `crate-type` contains `dylib` becomes a
+*cascade root*, and every non-proc-macro package reachable from it via
+runtime-dep edges is promoted to `["lib", "dylib"]` in the active profile.
+
+The motivating use case is hot-reload-style development where one or more
+Rust dylibs are loaded at runtime and need to share a single instance of
+every common dependency. Promoting only the top-level dylib leads to "output
+filename collision" warnings and link failures whenever a transitive dep is
+reached via both rlib and dylib paths; cascading turns the whole runtime
+closure into a consistent set of dylibs, so each `(crate, version)` resolves
+to one shared unit.
+
+Because the entire feature surface lives on the CLI, an unmodified
+`Cargo.toml` works with stock cargo: omitting `-Z cascade-dylib` reverts to
+standard behavior, where `crate-type = ["lib", "dylib"]` in a manifest emits
+both kinds for that package and the rest of the dep graph is built normally.
+
+### CLI surface
+
+```text
+cargo +nightly build -Z cascade-dylib              # bare: source 1 only
+cargo +nightly build -Z cascade-dylib=foo,bar      # adds foo, bar as roots
+cargo +nightly build -Z cascade-dylib=foo@1.2.3    # PackageIdSpec also works
+```
+
+Cascade fires only when the flag is passed. Roots are collected from two
+sources:
+
+1. **Manifest** — the package's own `[lib].crate-type` includes `dylib`.
+   Common when the workspace lib is built as a Rust dylib (e.g. for
+   hot-reload). **Source 1 only contributes a cascade root when the
+   requested profile is `dev` or transitively inherits from `dev`** (so
+   `dev`, `test`, `doc`, and any user-defined profile that ultimately
+   inherits `dev`). Cascade is a dev-loop concept — release builds
+   shouldn't pay the cost, and dylib promotion strips C archive
+   contributions out of crates whose Rust wrapper statically links a `.a`
+   (e.g. `tree-sitter`, anything else with a `cc`/`bindgen` build script),
+   producing release-only link errors. Under `release`/`bench`/any
+   release-rooted profile, the manifest `dylib` entry is still honored for
+   the package itself (cargo emits both `lib` and `dylib` artifacts as it
+   always has), but no BFS over its runtime deps fires.
+2. **CLI list** — each entry in `-Z cascade-dylib=spec1,spec2,...` is
+   parsed as a [`PackageIdSpec`] and matched against the resolve graph.
+   Matching packages become cascade roots regardless of profile. Use this
+   to add roots that aren't already manifest dylibs, or to opt into a
+   release-profile cascade when you genuinely need one (uncommon).
+
+[`PackageIdSpec`]: pkgid-spec.md
+
+A spec that doesn't match any package in the resolve graph emits a warning
+but does not fail the build.
+
+### Example
+
+```toml
+# Cargo.toml — unmodified; portable to stock cargo.
+[package]
+name = "my_app"
+# ...
+
+[lib]
+crate-type = ["lib", "dylib"]
+
+[dependencies]
+iced = "0.13"
+```
+
+```text
+cargo +nightly build -Z cascade-dylib
+```
+
+`my_app` is a manifest dylib (source 1), so `iced` and every package
+reachable from `my_app` through `[dependencies]` (and from those,
+transitively) is promoted to `["lib", "dylib"]` for `dev`. No explicit list
+of roots is required — the manifest declaration carries the entire intent.
+
+Running `cargo build` (without `-Z cascade-dylib`) on the same manifest
+produces a standard dev build: `my_app` still emits both rlib and dylib (as
+it has historically), but `iced` and its transitive deps are built as plain
+rlibs.
+
+### Edge filtering
+
+The cascade BFS follows only **runtime-dep** (`DepKind::Normal`) edges:
+
+* Build-script deps are not followed (build scripts run on the host and don't
+  reach the runtime dylib graph).
+* Dev-deps are not followed.
+* Proc-macros are skipped — they can't be dylibs and the cascade never
+  promotes them.
+
+If multiple versions of the same name are in the resolve graph, every reached
+version is promoted independently.
+
+### rpath embedding
+
+On macOS and ELF Unix targets, every cascade dylib (root or promoted) is
+linked with an additional `-Wl,-rpath,@loader_path/deps` (`$ORIGIN/deps` on
+Linux + BSDs) entry, so the dynamic loader finds the SVH-stamped sibling
+dylibs at `target/<profile>/deps/` regardless of who's loading the dylib.
+Without this, `cargo install`'d binaries and arbitrary `dlopen` consumers
+hit `dlopen failed` on the first transitive `@rpath/lib*-<svh>.dylib`
+reference. Windows (PE) doesn't use rpath and is a no-op.
+
+### Per-package opt-out
+
+#### Native-library crates
+
+Crates whose build script ships native objects — typically a `cc`/`bindgen`/
+`cmake`/`pkg-config` build dep that emits `cargo:rustc-link-lib` — generally
+need to be excluded from the cascade. Cargo records the build-script's
+native-static-libs contribution against the `rlib`; promoting the same
+package to `dylib` strips those contributions, so any downstream consumer
+that calls into the C API fails to link with errors like:
+
+```
+Undefined symbols for architecture arm64:
+    "_ts_query_cursor_next_capture", referenced from:
+        ...
+ld: symbol(s) not found for architecture arm64
+```
+
+The flag has no exclusion syntax in this iteration. If your workspace has
+such a crate in the runtime closure, prefer the explicit-roots form
+(`-Z cascade-dylib=root1,root2`) and choose roots that don't transitively
+reach the affected package; or drop `-Z cascade-dylib` for builds that hit
+the native code path.
+
+There is no automatic detection: `links = "..."` is too coarse (some crates
+use it as a singleton marker without shipping native code, e.g. `rayon-core`),
+and a build-dep heuristic over `cc`/`bindgen` would entangle cargo with
+specific ecosystems.
+
+### Configuration-file form
+
+To enable from a Cargo configuration file, set the flag in the `[unstable]`
+table:
+
+```toml
+# .cargo/config.toml
+[unstable]
+cascade-dylib = []                       # bare: source 1 only
+# or
+cascade-dylib = ["foo", "bar"]           # explicit roots
 ```
 
 ## Profile `hint-mostly-unused` option

@@ -394,11 +394,16 @@ pub fn create_bcx<'a, 'gctx>(
         );
     }
 
-    let profiles = Profiles::new(ws, build_config.requested_profile)?;
+    let mut profiles = Profiles::new(ws, build_config.requested_profile)?;
     profiles.validate_packages(
         ws.profiles(),
         &mut gctx.shell(),
         workspace_resolve.as_ref().unwrap_or(&resolve),
+    )?;
+    profiles.apply_cascade_dylib(
+        workspace_resolve.as_ref().unwrap_or(&resolve),
+        &pkg_set,
+        gctx,
     )?;
 
     // If `--target` has not been specified, then the unit graph is built
