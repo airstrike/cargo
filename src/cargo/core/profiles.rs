@@ -527,23 +527,85 @@ impl Profiles {
         // existing entries (so user-set opt-level/codegen-units/etc.
         // continue to apply alongside the cascade-set crate-type) and
         // skips packages whose manifest already emits a dylib.
+        //
+        // Reconcile against existing overrides by `spec.matches(id)`
+        // rather than keying blindly by `name@version`. A user can write
+        // a per-package override under EITHER spelling — `tree-sitter`
+        // (name only) or `tree-sitter@0.26.8` (version-pinned) — and the
+        // two are distinct `BTreeMap` keys (`ProfilePackageSpec` orders
+        // by string form). If the cascade inserted its own `name@version`
+        // key unconditionally, a user's name-only entry for the same
+        // package would (a) be left untouched, so two overrides then both
+        // `.matches()` the same `PackageId` and trip the defensive assert
+        // in `merge_toml_overrides` (whose "validate_packages should have
+        // caught it" comment predates the cascade, which injects AFTER
+        // validation runs), and (b) be silently defeated — the fresh
+        // entry has no `crate_type`, so the cascade promotes the package
+        // anyway, overriding the user's deliberate rlib opt-out (e.g. a
+        // package whose `build.rs` links a C archive whose symbols don't
+        // survive the dylib boundary).
+        //
+        // So: if a per-package `Spec` override already matches the id,
+        // mutate THAT entry — and if it already sets `crate_type`, the
+        // user expressed intent for this package, so leave it alone. Only
+        // when nothing matches do we insert a fresh version-pinned key.
+        // A blanket `*` (`All`) override that itself pins `crate_type`
+        // likewise counts as the user having spoken for every package.
+        //
+        // The scan is O(closure × overrides), but the override map is
+        // normally tiny (and `validate_packages_unique` already does the
+        // same per-pair `matches` scan), so don't "optimize" this back to
+        // blind keying — that reintroduces the dual-key bug above.
         let package_map = toml.package.get_or_insert_with(BTreeMap::new);
+        let all_pins_crate_type = package_map
+            .get(&ProfilePackageSpec::All)
+            .map(|p| p.crate_type.is_some())
+            .unwrap_or(false);
         let mut promoted_count = 0usize;
         for id in &closure {
             if manifest_dylib.contains(id) {
                 continue;
             }
-            let mut spec = PackageIdSpec::new(id.name().to_string());
-            if let Ok(pv) = id.version().to_string().parse() {
-                spec = spec.with_version(pv);
-            }
-            let key = ProfilePackageSpec::Spec(spec);
-            let entry = package_map
-                .entry(key)
-                .or_insert_with(TomlProfile::default);
-            if entry.crate_type.is_none() {
-                entry.crate_type = Some(vec!["lib".into(), "dylib".into()]);
-                promoted_count += 1;
+            // At most one pre-existing `Spec` can match a given package:
+            // `validate_packages_unique` ran before the cascade and bails
+            // on a user-authored double-match, and the version-pinned keys
+            // the cascade inserts below are maximally specific (one exact
+            // package each), so they never cross-match other closure ids.
+            let matching_key = package_map
+                .keys()
+                .find(|key| match key {
+                    ProfilePackageSpec::Spec(spec) => spec.matches(*id),
+                    ProfilePackageSpec::All => false,
+                })
+                .cloned();
+            match matching_key {
+                Some(key) => {
+                    let entry = package_map
+                        .get_mut(&key)
+                        .expect("key came from the map's own iterator");
+                    if entry.crate_type.is_none() {
+                        entry.crate_type = Some(vec!["lib".into(), "dylib".into()]);
+                        promoted_count += 1;
+                    }
+                    // else: the user pinned `crate_type` for this spec
+                    // (e.g. an rlib opt-out) — respect it, skip promotion.
+                }
+                None => {
+                    if all_pins_crate_type {
+                        // A `*` override pins `crate_type` for every
+                        // package; treat that as the user's call and skip.
+                        continue;
+                    }
+                    let mut spec = PackageIdSpec::new(id.name().to_string());
+                    if let Ok(pv) = id.version().to_string().parse() {
+                        spec = spec.with_version(pv);
+                    }
+                    let entry = package_map
+                        .entry(ProfilePackageSpec::Spec(spec))
+                        .or_insert_with(TomlProfile::default);
+                    entry.crate_type = Some(vec!["lib".into(), "dylib".into()]);
+                    promoted_count += 1;
+                }
             }
         }
 

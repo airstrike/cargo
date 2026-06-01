@@ -1042,6 +1042,136 @@ fn cascade_dylib_cli_spec_walks_runtime_closure() {
 }
 
 #[cargo_test]
+fn cascade_dylib_respects_name_only_crate_type_optout() {
+    // A user-written name-only `[profile.dev.package.<name>] crate-type`
+    // opt-out must survive the cascade: the package stays rlib-only even
+    // though the BFS would otherwise promote it. The motivating case is a
+    // package whose `build.rs` links a C archive whose symbols don't
+    // survive the dylib boundary (e.g. tree-sitter), so promoting it
+    // produces an undefined-symbol link error.
+    //
+    // Two failure modes this guards against, both from the cascade keying
+    // its synthesized override by `name@version` while the user wrote a
+    // name-only key — distinct `BTreeMap` keys that both match the same
+    // `PackageId`:
+    //   1. a `package ... matched multiple package profile overrides`
+    //      panic in `merge_toml_overrides` (the cascade injects after
+    //      `validate_packages` runs, so validation can't catch it), and
+    //   2. the opt-out being silently ignored — the cascade's fresh entry
+    //      has no `crate_type`, so it promotes the package anyway.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+
+                [profile.dev.package.baz]
+                crate-type = ["lib"]
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "extern crate baz;")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    // bar is promoted; baz keeps the user's rlib-only crate-type and is
+    // NOT promoted (and the build does not panic).
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_does_not_contain("[..]matched multiple package profile overrides[..]")
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name bar [..]--crate-type lib --crate-type dylib [..]`
+...
+"#]])
+        .run();
+
+    // Assert baz built as a bare rlib: a `--crate-type lib` invocation
+    // with NO trailing `--crate-type dylib`. Checked separately from the
+    // glob above because `with_stderr_data` can't easily express "this
+    // flag but not that one" on a single line.
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_does_not_contain(
+            "[RUNNING] `rustc --crate-name baz [..]--crate-type dylib[..]`",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cascade_dylib_mutates_name_only_override_without_crate_type() {
+    // A user-written name-only override that sets some OTHER field (here
+    // `opt-level`) but no `crate-type` must have the cascade add
+    // `crate-type` to that same entry — not insert a second `name@version`
+    // key (which would trip the multiple-overrides panic). The opt-level
+    // and the cascade-set dylib both apply.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+
+                [dependencies]
+                bar = { path = "bar" }
+
+                [profile.dev.package.baz]
+                opt-level = 2
+            "#,
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "extern crate baz;")
+        .file("baz/Cargo.toml", &basic_lib_manifest("baz"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    // baz is promoted (cascade adds crate-type to the existing entry) and
+    // the user's opt-level=2 still applies — no panic from a duplicate key.
+    p.cargo("build -v -Z cascade-dylib=bar")
+        .masquerade_as_nightly_cargo(&[])
+        .with_stderr_does_not_contain("[..]matched multiple package profile overrides[..]")
+        .with_stderr_data(str![[r#"
+...
+[RUNNING] `rustc --crate-name baz [..]--crate-type lib --crate-type dylib [..]-C opt-level=2 [..]`
+...
+"#]])
+        .run();
+}
+
+#[cargo_test]
 fn cascade_dylib_no_op_without_flag() {
     // The cascade only fires when `-Z cascade-dylib` is passed. A package
     // using `crate-type = ["lib", "dylib"]` in its manifest without the
