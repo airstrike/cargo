@@ -933,15 +933,21 @@ pub struct TomlProfile {
     pub strip: Option<StringOrBool>,
     // Note that `rustflags` is used for the cargo-feature `profile_rustflags`
     pub rustflags: Option<Vec<String>>,
-    /// Internal carrier for synthesized per-package `[lib].crate-type`
-    /// overrides written by the `cascade-dylib` machinery. Not a
-    /// user-input field — `#[serde(skip)]` blocks it from being set via
-    /// `Cargo.toml` and from being emitted on serialization. The cascade
-    /// reads `-Z cascade-dylib[=roots,...]` and writes synthesized
-    /// `Some(vec!["lib", "dylib"])` entries here for every package in
-    /// the runtime-dep closure of a cascade root.
-    #[serde(skip)]
-    #[cfg_attr(feature = "unstable-schema", schemars(skip))]
+    /// Per-package `[lib].crate-type` override. Two writers:
+    ///
+    /// 1. Users, via `[profile.<P>.package.<name>] crate-type = [...]`
+    ///    in `Cargo.toml` — most often `["lib"]` to opt a package OUT
+    ///    of `cascade-dylib` promotion (e.g. a `cc`/`bindgen` crate
+    ///    whose native-static-lib symbols don't survive the rlib→dylib
+    ///    boundary; promoting it produces undefined-symbol link errors
+    ///    in its consumers). The cascade reads this and skips any
+    ///    package the user already pinned.
+    /// 2. The `cascade-dylib` machinery, which synthesizes
+    ///    `Some(vec!["lib", "dylib"])` entries for every package in the
+    ///    runtime-dep closure of a cascade root the user hasn't pinned.
+    ///
+    /// Only meaningful on a per-package override; a value on a bare
+    /// `[profile.<P>]` block is ignored.
     pub crate_type: Option<Vec<String>>,
     // These two fields must be last because they are sub-tables, and TOML
     // requires all non-tables to be listed first.
