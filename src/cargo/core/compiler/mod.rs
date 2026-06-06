@@ -306,6 +306,12 @@ fn rustc(
     let manifest = ManifestErrorContext::new(build_runner, unit);
     let build_scripts = build_runner.build_scripts.get(unit).cloned();
 
+    // Whether this cascade-promoted `links` dylib must force-load + re-export
+    // its native static archive (computed now; applied in `add_native_deps`,
+    // which runs at link time when the build-script output is populated).
+    let cascade_reexport =
+        cascade_dylib_shim::cascade_needs_native_reexport(build_runner.bcx, unit);
+
     // If we are a binary and the package also contains a library, then we
     // don't pass the `-l` flags.
     let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
@@ -389,6 +395,7 @@ fn rustc(
                 &target,
                 current_id,
                 mode,
+                cascade_reexport,
             )?;
             if let Some(ref root_output) = root_output {
                 add_plugin_deps(&mut rustc, &script_outputs, &build_scripts, root_output)?;
@@ -540,6 +547,7 @@ fn rustc(
         target: &Target,
         current_id: PackageId,
         mode: CompileMode,
+        cascade_reexport: bool,
     ) -> CargoResult<()> {
         let mut library_paths = vec![];
 
@@ -567,6 +575,7 @@ fn rustc(
             rustc.arg("-L").arg(path.as_ref());
         }
 
+        let mut cascade_force_loaded = false;
         for key in build_scripts.to_link.iter() {
             let output = build_script_outputs.get(key.1).ok_or_else(|| {
                 internal(format!(
@@ -578,7 +587,59 @@ fn rustc(
             if key.0 == current_id {
                 if pass_l_flag {
                     for name in output.library_links.iter() {
-                        rustc.arg("-l").arg(name);
+                        // A cascade-promoted `links` dylib must absorb its own
+                        // native static archive *whole*: the `-sys` crate is
+                        // only `extern` declarations and never references the C
+                        // symbols, so `ld` pulls zero members on a plain `-l`
+                        // and `-dead_strip` drops the rest. Link it via
+                        // `-force_load` (pull every member) so the symbols land
+                        // in this dylib; the export glob below keeps and exports
+                        // them, letting sibling promoted dylibs (`zstd-safe`/
+                        // `zstd`, whose inline wrappers monomorphize the calls)
+                        // resolve them. Crucially we emit `-force_load` *instead
+                        // of* the plain `-l`: ld dedups an archive by path, so a
+                        // plain `-l` naming the same file would win and the
+                        // force-load would be silently dropped. See
+                        // `cascade_dylib_shim::cascade_needs_native_reexport`.
+                        let mut force_loaded = false;
+                        if cascade_reexport {
+                            if let Some((kind, lib)) = name.split_once('=') {
+                                if kind.starts_with("static") {
+                                    for &path in library_paths.iter() {
+                                        let dir = match path {
+                                            LibraryPath::CargoArtifact(p)
+                                            | LibraryPath::External(p) => p,
+                                        };
+                                        // `LibraryPath` holds the `-L` spec, which may carry a
+                                        // kind prefix like `native=/path`; strip it to the dir.
+                                        let dir_str = dir.to_string_lossy();
+                                        let bare = dir_str
+                                            .split_once('=')
+                                            .filter(|(k, _)| {
+                                                !k.is_empty()
+                                                    && k.bytes().all(|b| b.is_ascii_lowercase())
+                                            })
+                                            .map(|(_, rest)| rest)
+                                            .unwrap_or(dir_str.as_ref());
+                                        let archive =
+                                            std::path::Path::new(bare).join(format!("lib{lib}.a"));
+                                        if archive.exists() {
+                                            let mut arg = std::ffi::OsString::from(
+                                                "link-arg=-Wl,-force_load,",
+                                            );
+                                            arg.push(&archive);
+                                            rustc.arg("-C").arg(arg);
+                                            cascade_force_loaded = true;
+                                            force_loaded = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !force_loaded {
+                            rustc.arg("-l").arg(name);
+                        }
                     }
                 }
             }
@@ -595,6 +656,13 @@ fn rustc(
                     rustc.arg("-C").arg(format!("link-arg={}", arg));
                 }
             }
+        }
+        // Widen this dylib's export set so the force-loaded C symbols are
+        // visible (macOS rustc passes a restrictive `-exported_symbols_list`;
+        // `ld` unions extra `-exported_symbol` entries with it). Only when we
+        // force-loaded an archive, so archive-free dylibs keep `-dead_strip`.
+        if cascade_force_loaded {
+            rustc.arg("-C").arg("link-arg=-Wl,-exported_symbol,_*");
         }
         Ok(())
     }

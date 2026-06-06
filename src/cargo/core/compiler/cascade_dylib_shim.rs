@@ -168,6 +168,59 @@ pub fn cascade_rpath_args(
     Ok(vec![OsString::from("-C"), link_arg])
 }
 
+/// Whether a cascade-promoted dylib should force-load and re-export the C
+/// symbols of any native static archive it links. The actual link args are
+/// emitted by [`add_native_deps`] at link time, where the build-script
+/// output (the `-l static=…` names and their `-L` search dirs) is in hand;
+/// this is just the unit-level gate, computed up front for that closure.
+///
+/// Why it's needed: on macOS, rustc passes `-exported_symbols_list` naming
+/// only the crate's own Rust symbols. A `-sys` crate is just `extern`
+/// declarations — it never *calls* the C functions — so `ld` pulls zero
+/// members from the static archive (static archives load only referenced
+/// members), and even force-loaded members would be hidden by that export
+/// list. A Rust FFI consumer reached through a *separate* promoted dylib
+/// (`zstd-safe`/`zstd`, whose `#[inline]`/generic wrappers monomorphize the
+/// `extern` calls into their own codegen unit) then can't resolve them, and
+/// the link fails with undefined native symbols — the failure that blocks
+/// promoting `-sys` crates to dylibs at all. The fix pairs `-force_load`
+/// (pull every archive member in) with `-Wl,-exported_symbol,_*` (macOS
+/// `ld` *unions* it with rustc's list, widening exports to cover the C
+/// symbols, and keeps them as GC roots). Depth-independent through any
+/// wrapper chain, and avoids the link-format diamond that keeping the
+/// `links` crate rlib would cause.
+///
+/// The gate is just "a promoted lib dylib on macOS". The real scoping happens
+/// in [`add_native_deps`], which force-loads + re-exports ONLY when the unit's
+/// build-script output actually declares a `static=` native lib. So pure-Rust
+/// dylibs (the app, iced, …) and `links`-marker crates with no archive (e.g.
+/// `rayon-core`) get nothing and keep their `-dead_strip`; only true archive
+/// absorbers pay the export glob's no-dead-strip cost. We deliberately do NOT
+/// gate on the manifest `links` key: plenty of `-sys` crates emit
+/// `rustc-link-lib=static` without declaring `links` (e.g. `openpnp_capture_sys`).
+/// ELF is excluded: a shared object exports its globals by default, so a linked
+/// archive's symbols cross dylib boundaries unaided. (macOS additionally needs
+/// the archive built `-fvisibility=default`, else its symbols are private-extern
+/// and unexportable — that's a build-flag concern, not handled here.)
+pub fn cascade_needs_native_reexport(bcx: &BuildContext<'_, '_>, unit: &Unit) -> bool {
+    if bcx.gctx.cli_unstable().cascade_dylib.is_none() {
+        return false;
+    }
+    if !unit.target.is_lib() {
+        return false;
+    }
+    let manifest_dylib = unit.target.rustc_crate_types().contains(&CrateType::Dylib);
+    let profile_dylib = unit
+        .profile
+        .crate_type
+        .as_deref()
+        .map_or(false, |ct| ct.contains(&CrateType::Dylib));
+    if !manifest_dylib && !profile_dylib {
+        return false;
+    }
+    bcx.target_data.short_name(&unit.kind).contains("-apple-")
+}
+
 /// Builds the `--extern force:std=<dylib> --extern force:std=<rmeta>`
 /// argument pair for the given `kind`'s sysroot, picking the freshest
 /// `libstd-<hash>.{dylib,rmeta}` pair.
