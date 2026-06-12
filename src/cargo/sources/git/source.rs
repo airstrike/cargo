@@ -442,12 +442,6 @@ impl<'gctx> Source for GitSource<'gctx> {
         format!("Git repository {}", self.source_id.borrow())
     }
 
-    fn add_to_yanked_whitelist(&self, _pkgs: &[PackageId]) {}
-
-    async fn is_yanked(&self, _pkg: PackageId) -> CargoResult<bool> {
-        Ok(false)
-    }
-
     fn invalidate_cache(&self) {}
 
     fn set_quiet(&mut self, quiet: bool) {

@@ -437,7 +437,13 @@ fn alt_versions(registry: &impl Registry, dep: &Dependency) -> Option<CargoResul
         Ok(candidates) => candidates,
         Err(e) => return Some(Err(e)),
     };
-    let mut candidates: Vec<_> = candidates.into_iter().map(|s| s.into_summary()).collect();
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|s| match s {
+            IndexSummary::Candidate(s) => Some(s),
+            _ => None,
+        })
+        .collect();
     candidates.sort_unstable_by(|a, b| b.version().cmp(a.version()));
     if candidates.is_empty() {
         None
@@ -456,7 +462,7 @@ fn rejected_versions(
             Ok(candidates) => candidates,
             Err(e) => return Some(Err(e)),
         };
-    version_candidates.sort_unstable_by_key(|a| a.as_summary().version().clone());
+    version_candidates.sort_unstable_by_key(|a| a.package_id().version().clone());
     if version_candidates.is_empty() {
         None
     } else {
@@ -480,7 +486,13 @@ fn alt_names(
         };
     let mut name_candidates: Vec<_> = name_candidates
         .into_iter()
-        .map(|s| s.into_summary())
+        .map(|s| match s {
+            IndexSummary::Candidate(sum)
+            | IndexSummary::Yanked(sum)
+            | IndexSummary::Offline(sum)
+            | IndexSummary::Unsupported(sum, _)
+            | IndexSummary::Invalid(sum) => sum,
+        })
         .collect();
     name_candidates.sort_unstable_by_key(|a| a.name());
     name_candidates.dedup_by(|a, b| a.name() == b.name());
